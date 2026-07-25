@@ -7,8 +7,9 @@
 
 local obs = obslua
 local ffi = require("ffi")
-local VERSION = "1.0.2"
+local VERSION = "1.1.1"
 local CROP_FILTER_NAME = "obs-zoom-to-mouse-crop"
+local SCALE_FILTER_NAME = "obs-zoom-to-mouse-rescale"
 
 local socket_available, socket = pcall(require, "ljsocket")
 local socket_server = nil
@@ -24,6 +25,8 @@ local sceneitem_crop = nil
 local crop_filter = nil
 local crop_filter_temp = nil
 local crop_filter_settings = nil
+local scale_filter = nil
+local scale_filter_settings = nil
 local crop_filter_info_orig = { x = 0, y = 0, w = 0, h = 0 }
 local crop_filter_info = { x = 0, y = 0, w = 0, h = 0 }
 local monitor_info = nil
@@ -459,6 +462,18 @@ function release_sceneitem()
             crop_filter_settings = nil
         end
 
+        if scale_filter ~= nil and source ~= nil then
+            log("Zoom rescale filter removed")
+            obs.obs_source_filter_remove(source, scale_filter)
+            obs.obs_source_release(scale_filter)
+            scale_filter = nil
+        end
+
+        if scale_filter_settings ~= nil then
+            obs.obs_data_release(scale_filter_settings)
+            scale_filter_settings = nil
+        end
+
         if sceneitem_info_orig ~= nil then
             log("Transform info reset back to original")
             set_transform(sceneitem, sceneitem_info_orig)
@@ -485,6 +500,61 @@ end
 -- Updates the current sceneitem with a refreshed set of data from the source
 -- Optionally will release the existing sceneitem and get a new one from the current scene
 ---@param find_newest boolean True to release the current sceneitem and get a new one
+---
+-- Forces the current zoom sceneitem to exactly fill the OBS canvas using
+-- 'Scale to Outer Bounds' with Top-Left alignment, regardless of whatever
+-- transform is currently saved/active. This is self-healing: it does not
+-- matter if a previous (possibly broken) transform was saved to the scene
+-- collection file - it gets overwritten every time this runs.
+function force_canvas_fit()
+    if sceneitem == nil or use_monitor_override then
+        return
+    end
+
+    local ovi = obs.obs_video_info()
+    obs.obs_get_video_info(ovi)
+    local canvas_w = ovi.base_width
+    local canvas_h = ovi.base_height
+
+    if canvas_w <= 0 or canvas_h <= 0 then
+        return
+    end
+
+    if sceneitem_info == nil then
+        sceneitem_info = obs.obs_transform_info()
+    end
+    get_transform(sceneitem, sceneitem_info)
+
+    sceneitem_info.pos.x = 0
+    sceneitem_info.pos.y = 0
+    sceneitem_info.rot = 0
+    sceneitem_info.bounds_type = obs.OBS_BOUNDS_SCALE_OUTER
+    sceneitem_info.bounds_alignment = 5 -- Top Left
+    sceneitem_info.alignment = 5 -- Top Left
+    sceneitem_info.bounds.x = canvas_w
+    sceneitem_info.bounds.y = canvas_h
+    sceneitem_info.scale.x = 1
+    sceneitem_info.scale.y = 1
+
+    set_transform(sceneitem, sceneitem_info)
+
+    if sceneitem_info_orig ~= nil then
+        sceneitem_info_orig.pos.x = sceneitem_info.pos.x
+        sceneitem_info_orig.pos.y = sceneitem_info.pos.y
+        sceneitem_info_orig.rot = sceneitem_info.rot
+        sceneitem_info_orig.bounds_type = sceneitem_info.bounds_type
+        sceneitem_info_orig.bounds_alignment = sceneitem_info.bounds_alignment
+        sceneitem_info_orig.alignment = sceneitem_info.alignment
+        sceneitem_info_orig.bounds.x = sceneitem_info.bounds.x
+        sceneitem_info_orig.bounds.y = sceneitem_info.bounds.y
+        sceneitem_info_orig.scale.x = sceneitem_info.scale.x
+        sceneitem_info_orig.scale.y = sceneitem_info.scale.y
+    end
+
+    log("INFO: Zoom-Quelle wurde zwangsweise auf volle Canvas-Groesse (" .. canvas_w .. "x" .. canvas_h ..
+        ") mit 'Scale to Outer Bounds' (Top Left) gesetzt.")
+end
+
 function refresh_sceneitem(find_newest)
     local source_raw = { width = 0, height = 0 }
 
@@ -620,43 +690,11 @@ function refresh_sceneitem(find_newest)
             log("Using source size: " .. source_width .. ", " .. source_height)
         end
 
-        -- FIX: Der Original-Code hat hier "Scale to INNER Bounds" erzwungen. Inner Bounds passt die Quelle
-        -- komplett IN die Box hinein (wie "contain") - wenn das Seitenverhaeltnis der Quelle (z.B. 16:9 Monitor)
-        -- nicht zum Seitenverhaeltnis der Box/des Canvas passt (z.B. vertikales Streaming-Canvas), wird die Quelle
-        -- klein mit schwarzen Raendern in eine Ecke gequetscht - genau der gemeldete "schrumpft in die Ecke" Bug.
-        -- Laut offizieller Doku des Scripts MUSS der Source-Aufbau sein:
-        --   Positional Alignment: Top Left | Bounding Box Type: Scale to OUTER Bounds | Alignment in Bounding Box: Top Left
-        -- "Outer" Bounds fuellt die komplette Box aus (wie "cover") und schneidet ueberstehenden Inhalt ab,
-        -- anstatt die Quelle zu verkleinern. Das ist die einzige Kombination, mit der der Zoom danach sauber
-        -- funktioniert (Crop-Filter + Bounds arbeiten nur mit diesem Setup korrekt zusammen).
-        if sceneitem_info.bounds_type == obs.OBS_BOUNDS_NONE then
-            sceneitem_info.bounds_type = obs.OBS_BOUNDS_SCALE_OUTER
-            sceneitem_info.bounds_alignment = 5 -- Top Left
-            sceneitem_info.alignment = 5 -- Top Left (bestimmt, welche Ecke bei "Outer" sichtbar bleibt)
-            sceneitem_info.bounds.x = source_width * sceneitem_info.scale.x
-            sceneitem_info.bounds.y = source_height * sceneitem_info.scale.y
-
-            -- Skalierung wird jetzt durch die Bounds bestimmt, daher auf 1 setzen, damit sie nicht doppelt angewendet wird
-            sceneitem_info.scale.x = 1
-            sceneitem_info.scale.y = 1
-
-            set_transform(sceneitem, sceneitem_info)
-
-            -- Die gesicherte Original-Transform (fuer die Wiederherstellung nach dem Zoom) ebenfalls
-            -- auf den neuen Bounding-Box-Modus umstellen, sonst wird beim Beenden des Zooms wieder
-            -- die alte (jetzt falsche) Skalierung/Groesse hergestellt und die Quelle "springt" erneut.
-            sceneitem_info_orig.bounds_type = sceneitem_info.bounds_type
-            sceneitem_info_orig.bounds_alignment = sceneitem_info.bounds_alignment
-            sceneitem_info_orig.alignment = sceneitem_info.alignment
-            sceneitem_info_orig.bounds.x = sceneitem_info.bounds.x
-            sceneitem_info_orig.bounds.y = sceneitem_info.bounds.y
-            sceneitem_info_orig.scale.x = sceneitem_info.scale.x
-            sceneitem_info_orig.scale.y = sceneitem_info.scale.y
-
-            log("WARNING: Found existing non-boundingbox transform. This may cause issues with zooming.\n" ..
-                "         Settings have been auto converted to a 'Scale to Outer Bounds' (Top Left) transform instead.")
-        end
-
+        -- Erzwingt volle Canvas-Fuellung (Scale to Outer Bounds, Top Left). Self-healing gegen
+        -- kaputt gespeicherte Transforms. Ausgelagert in force_canvas_fit(), die zusaetzlich auch
+        -- direkt bei jedem Zoom-Hotkey-Druck aufgerufen wird (siehe on_toggle_zoom), damit der Fix
+        -- nicht davon abhaengt, ob OBS gerade ein Scene-Changed/Loaded Event feuert oder nicht.
+        force_canvas_fit()
         zoom_info.source_crop_filter = { x = 0, y = 0, w = 0, h = 0 }
         local found_crop_filter = false
         local filters = obs.obs_source_enum_filters(source)
@@ -742,7 +780,35 @@ function refresh_sceneitem(find_newest)
             crop_filter_settings = obs.obs_source_get_settings(crop_filter)
         end
 
+        -- FIX: Fuegt einen zweiten Filter (OBS' eingebauten "scale_filter" / "Skalierung/Seitenverhaeltnis")
+        -- direkt NACH dem Crop-Filter ein. Dieser skaliert das gecroppte (kleinere) Bild rechnerisch wieder
+        -- exakt auf die urspruengliche Quellgroesse hoch. Dadurch bleibt die von OBS gemeldete Aufloesung der
+        -- Quelle (obs_source_get_base_width/height) IMMER konstant, unabhaengig vom Zoom-Level.
+        --
+        -- Das ist entscheidend fuer Setups mit mehreren Canvases (z.B. Aitum Vertical Canvas): Jedes Canvas
+        -- (Main UND Vertikal) haelt seine EIGENE, komplett unabhaengige Transform/Skalierung fuer dieselbe
+        -- Quelle - unser Script kann dort nur das Main-Canvas-Sceneitem erreichen. Wenn aber die Quelle selbst
+        -- (dank dieses Filters) nie ihre gemeldete Groesse aendert, muessen wir das Main- ODER Vertikal-Item
+        -- ueberhaupt nicht anfassen - beide zeigen automatisch weiterhin korrekt in voller Groesse an, weil sie
+        -- schlicht nie mitbekommen, dass intern gecroppt wurde. Nur das BILD innerhalb der konstanten Groesse
+        -- aendert sich (Zoom-Effekt), nicht die Groesse selbst.
+        scale_filter = obs.obs_source_get_filter_by_name(source, SCALE_FILTER_NAME)
+        if scale_filter == nil then
+            scale_filter_settings = obs.obs_data_create()
+            obs.obs_data_set_string(scale_filter_settings, "sampling", "bicubic")
+            obs.obs_data_set_string(scale_filter_settings, "resolution",
+                zoom_info.source_size.width .. "x" .. zoom_info.source_size.height)
+            scale_filter = obs.obs_source_create_private("scale_filter", SCALE_FILTER_NAME, scale_filter_settings)
+            obs.obs_source_filter_add(source, scale_filter)
+        else
+            scale_filter_settings = obs.obs_source_get_settings(scale_filter)
+            obs.obs_data_set_string(scale_filter_settings, "resolution",
+                zoom_info.source_size.width .. "x" .. zoom_info.source_size.height)
+            obs.obs_source_update(scale_filter, scale_filter_settings)
+        end
+
         obs.obs_source_filter_set_order(source, crop_filter, obs.OBS_ORDER_MOVE_BOTTOM)
+        obs.obs_source_filter_set_order(source, scale_filter, obs.OBS_ORDER_MOVE_BOTTOM)
         set_crop_settings(crop_filter_info_orig)
     end
 end
@@ -807,6 +873,11 @@ end
 
 function on_toggle_zoom(pressed)
     if pressed then
+        -- Erzwingt bei JEDEM Tastendruck (nicht nur bei seltenen Lade-Events), dass die Quelle
+        -- exakt die Canvas-Groesse ausfuellt. Das ist der zuverlaessigste Zeitpunkt, da hier
+        -- garantiert ist, dass 'sceneitem' bereits gueltig aufgeloest wurde.
+        force_canvas_fit()
+
         if zoom_state == ZoomState.ZoomedIn or zoom_state == ZoomState.None then
             if zoom_state == ZoomState.ZoomedIn then
                 log("Zooming out")
