@@ -1,13 +1,13 @@
 --
--- OBS Zoom to Mouse
--- An OBS lua script to zoom a display-capture source to focus on the mouse.
--- Copyright (c) BlankSourceCode.  All rights reserved.
--- Ported to new OBS by Timexo
+-- Zoom to Mouse Pro
+-- A standalone OBS Lua script that smoothly zooms a display-capture source to follow the mouse.
+-- Originally based on "OBS Zoom to Mouse" by BlankSourceCode / ported by Timexo,
+-- now maintained as its own independent project with its own feature set.
 --
 
 local obs = obslua
 local ffi = require("ffi")
-local VERSION = "1.1.1"
+local VERSION = "1.2.0"
 local CROP_FILTER_NAME = "obs-zoom-to-mouse-crop"
 local SCALE_FILTER_NAME = "obs-zoom-to-mouse-rescale"
 
@@ -41,8 +41,31 @@ local zoom_target = nil
 local locked_center = nil
 local locked_last_pos = nil
 local hotkey_zoom_id = nil
-local hotkey_follow_id = nil
+local hotkey_cycle_zoom_id = nil
+local hotkey_freeze_id = nil
+local hotkey_zoom_level_1_id = nil
+local hotkey_zoom_level_2_id = nil
+local hotkey_zoom_level_3_id = nil
 local is_timer_running = false
+local is_manually_frozen = false
+
+-- v1.2.0: dedicated zoom-level hotkeys (1/2/3) + a stepped cycle hotkey
+local zoom_level_1 = 1.5
+local zoom_level_2 = 2
+local zoom_level_3 = 3
+local direct_zoom_active_level = nil -- which level (if any) is currently active via a direct/cycle hotkey press
+local cycle_step = 0 -- 0 = not using the cycle hotkey right now, 1/2/3 = currently at level 1/2/3 via the cycle hotkey
+
+-- v1.2.0: per-scene zoom level memory
+local use_per_scene_zoom_memory = false
+local scene_zoom_memory = {}
+local current_scene_name = nil
+
+-- v1.2.0: opt-in self-healing across every scene (not just the current one)
+local fix_all_scenes = false
+
+-- v1.2.0: preset system (holds the live settings reference so button callbacks can read/write it)
+local current_settings = nil
 
 local win_point = nil
 local x11_display = nil
@@ -294,7 +317,7 @@ function lerp(v0, v1, t)
 end
 
 ---
--- Ease a time value in and out
+-- Ease a time value in and out (cubic)
 ---@param t number Time between 0 and 1
 ---@return number
 function ease_in_out(t)
@@ -315,6 +338,371 @@ end
 ---@return number result the clamped number
 function clamp(min, max, value)
     return math.max(min, math.min(max, value))
+end
+
+---
+-- Gets the name of the currently active OBS program scene (or nil)
+---@return string|nil
+function get_current_scene_name()
+    local scene_source = obs.obs_frontend_get_current_scene()
+    local name = nil
+    if scene_source ~= nil then
+        name = obs.obs_source_get_name(scene_source)
+        obs.obs_source_release(scene_source)
+    end
+    return name
+end
+
+---
+-- Serializes the per-scene zoom memory table into a single string for storage in script settings
+---@return string
+function serialize_scene_zoom_memory()
+    local parts = {}
+    for scene_name, level in pairs(scene_zoom_memory) do
+        table.insert(parts, scene_name .. "\29" .. tostring(level))
+    end
+    return table.concat(parts, "\30")
+end
+
+---
+-- Restores the per-scene zoom memory table from a string previously produced by serialize_scene_zoom_memory
+---@param str string
+function deserialize_scene_zoom_memory(str)
+    scene_zoom_memory = {}
+    if str == nil or str == "" then
+        return
+    end
+
+    for entry in string.gmatch(str, "([^\30]+)") do
+        local scene_name, level = entry:match("(.+)\29(.+)")
+        if scene_name ~= nil and level ~= nil then
+            scene_zoom_memory[scene_name] = tonumber(level)
+        end
+    end
+end
+
+---
+-- Called whenever the active OBS scene changes. If per-scene zoom memory is enabled, this
+-- remembers the zoom level that was in use for the scene we're leaving, and restores whatever
+-- zoom level (if any) was previously used the last time we were on the new scene.
+function handle_scene_changed_for_zoom_memory()
+    if not use_per_scene_zoom_memory then
+        return
+    end
+
+    if current_scene_name ~= nil then
+        scene_zoom_memory[current_scene_name] = zoom_value
+    end
+
+    local new_scene_name = get_current_scene_name()
+    if new_scene_name ~= nil and scene_zoom_memory[new_scene_name] ~= nil then
+        zoom_value = scene_zoom_memory[new_scene_name]
+        zoom_info.zoom_to = zoom_value
+        log("Restored remembered zoom level for scene '" .. new_scene_name .. "': " .. zoom_value .. "x")
+    end
+
+    current_scene_name = new_scene_name
+end
+
+---
+-- Makes sure the animation timer is running (shared by every way of starting/retargeting a zoom)
+function ensure_zoom_timer_running()
+    if is_timer_running == false then
+        is_timer_running = true
+        local timer_interval = math.floor(obs.obs_get_frame_interval_ns() / 1000000)
+        obs.timer_add(on_timer, timer_interval)
+    end
+end
+
+---
+-- Starts a fresh zoom-in from the normal (un-zoomed) state, targeting the given zoom level
+---@param level number
+function start_zoom_in_at_level(level)
+    force_canvas_fit()
+    log("Zooming in at " .. level .. "x")
+    zoom_state = ZoomState.ZoomingIn
+    zoom_info.zoom_to = level
+    zoom_time = 0
+    locked_center = nil
+    locked_last_pos = nil
+    zoom_target = get_target_position(zoom_info)
+    ensure_zoom_timer_running()
+end
+
+---
+-- Smoothly re-targets an already-active zoom to a new zoom level, without zooming back out first
+---@param level number
+function retarget_zoom_level(level)
+    log("Re-targeting zoom to " .. level .. "x")
+    zoom_info.zoom_to = level
+    zoom_time = 0
+    zoom_state = ZoomState.ZoomingIn
+    zoom_target = get_target_position(zoom_info)
+    ensure_zoom_timer_running()
+end
+
+---
+-- Starts zooming back out to the normal (un-zoomed) view
+function start_zoom_out()
+    log("Zooming out")
+    zoom_state = ZoomState.ZoomingOut
+    zoom_time = 0
+    locked_center = nil
+    locked_last_pos = nil
+    zoom_target = { crop = crop_filter_info_orig, c = sceneitem_crop_orig }
+    if is_following_mouse then
+        is_following_mouse = false
+        log("Tracking mouse is off (due to zoom out)")
+    end
+    ensure_zoom_timer_running()
+end
+
+---
+-- Shared handler for the three dedicated "Zoom to Nx" hotkeys. Pressing the hotkey for the
+-- level that's already active zooms back out; pressing it while zoomed to a different level
+-- smoothly re-targets to the new level; pressing it while not zoomed starts a fresh zoom-in.
+---@param level number
+function handle_direct_zoom_level_press(level)
+    if zoom_state == ZoomState.None then
+        cycle_step = 0
+        direct_zoom_active_level = level
+        start_zoom_in_at_level(level)
+    elseif zoom_state == ZoomState.ZoomedIn or zoom_state == ZoomState.ZoomingIn then
+        if direct_zoom_active_level ~= nil and math.abs(direct_zoom_active_level - level) < 0.0001 then
+            direct_zoom_active_level = nil
+            cycle_step = 0
+            start_zoom_out()
+        else
+            direct_zoom_active_level = level
+            cycle_step = 0
+            retarget_zoom_level(level)
+        end
+    end
+end
+
+function on_toggle_zoom_level_1(pressed)
+    if pressed then
+        handle_direct_zoom_level_press(zoom_level_1)
+    end
+end
+
+function on_toggle_zoom_level_2(pressed)
+    if pressed then
+        handle_direct_zoom_level_press(zoom_level_2)
+    end
+end
+
+function on_toggle_zoom_level_3(pressed)
+    if pressed then
+        handle_direct_zoom_level_press(zoom_level_3)
+    end
+end
+
+---
+-- Steps through Zoom Level 1 -> Level 2 -> Level 3 -> zoomed out, one step per press.
+-- Pressing it while already zoomed in via a direct level hotkey restarts the cycle at Level 1.
+function on_cycle_zoom_level(pressed)
+    if not pressed then
+        return
+    end
+
+    if zoom_state == ZoomState.None then
+        cycle_step = 1
+        direct_zoom_active_level = zoom_level_1
+        start_zoom_in_at_level(zoom_level_1)
+        return
+    end
+
+    if zoom_state ~= ZoomState.ZoomedIn and zoom_state ~= ZoomState.ZoomingIn then
+        return
+    end
+
+    if cycle_step >= 3 then
+        cycle_step = 0
+        direct_zoom_active_level = nil
+        start_zoom_out()
+        return
+    end
+
+    if cycle_step == 0 then
+        -- Currently zoomed in via something other than the cycle hotkey - restart the cycle
+        cycle_step = 1
+        direct_zoom_active_level = zoom_level_1
+        retarget_zoom_level(zoom_level_1)
+        return
+    end
+
+    cycle_step = cycle_step + 1
+    local level = zoom_level_1
+    if cycle_step == 2 then
+        level = zoom_level_2
+    elseif cycle_step == 3 then
+        level = zoom_level_3
+    end
+
+    direct_zoom_active_level = level
+    retarget_zoom_level(level)
+end
+
+---
+-- Toggles a manual "freeze" of the mouse tracking while zoomed in - the view stops following
+-- the mouse until unfrozen again, without zooming back out. Distinct from the auto-lock/safezone
+-- tracking feature, which resumes automatically; this only resumes when the hotkey is pressed again.
+function on_toggle_freeze(pressed)
+    if not pressed then
+        return
+    end
+
+    if zoom_state ~= ZoomState.ZoomedIn and zoom_state ~= ZoomState.ZoomingIn then
+        log("Freeze hotkey ignored - not currently zoomed in.")
+        return
+    end
+
+    is_manually_frozen = not is_manually_frozen
+    log("Zoom view is now " .. (is_manually_frozen and "FROZEN (mouse tracking paused)" or "unfrozen (mouse tracking resumed)"))
+end
+
+---
+-- Applies the "fill the canvas with Scale to Outer Bounds / Top Left" fix to EVERY scene that
+-- contains the configured zoom source, not just the current one. Opt-in (Fix All Scenes setting)
+-- since forcing this everywhere isn't correct if a scene intentionally uses the source as a small
+-- picture-in-picture layout - only enable this if you want the source to always fill the canvas
+-- in every scene it appears in.
+function force_canvas_fit_all_scenes()
+    if use_monitor_override or source_name == nil or source_name == "" then
+        return
+    end
+
+    local ovi = obs.obs_video_info()
+    obs.obs_get_video_info(ovi)
+    local canvas_w = ovi.base_width
+    local canvas_h = ovi.base_height
+    if canvas_w <= 0 or canvas_h <= 0 then
+        return
+    end
+
+    local scenes = obs.obs_frontend_get_scenes()
+    if scenes == nil then
+        return
+    end
+
+    local fixed_count = 0
+    for _, scene_source in ipairs(scenes) do
+        local sc = obs.obs_scene_from_source(scene_source)
+        if sc ~= nil then
+            local item = obs.obs_scene_find_source(sc, source_name)
+            if item ~= nil then
+                local info = obs.obs_transform_info()
+                get_transform(item, info)
+                info.pos.x = 0
+                info.pos.y = 0
+                info.rot = 0
+                info.bounds_type = obs.OBS_BOUNDS_SCALE_OUTER
+                info.bounds_alignment = 5
+                info.alignment = 5
+                info.bounds.x = canvas_w
+                info.bounds.y = canvas_h
+                info.scale.x = 1
+                info.scale.y = 1
+                set_transform(item, info)
+                fixed_count = fixed_count + 1
+            end
+        end
+    end
+    obs.source_list_release(scenes)
+
+    if fixed_count > 0 then
+        log("INFO: 'Fix All Scenes' applied canvas-fit to " .. fixed_count .. " scene(s) containing '" ..
+            source_name .. "'.")
+    end
+end
+
+---
+-- Runs a human-readable diagnostic check of the current zoom source setup and prints the
+-- results to the Script Log. Useful for figuring out why a source might not be filling the
+-- canvas correctly, or is present in multiple scenes with mismatched configurations.
+function run_diagnostics()
+    log("==================== Zoom to Mouse Pro: Setup Diagnostics ====================")
+
+    if source_name == nil or source_name == "" or source_name == "obs-zoom-to-mouse-none" then
+        log("PROBLEM: No Zoom Source is selected in the script settings.")
+        log("================================================================================")
+        return
+    end
+
+    if sceneitem == nil then
+        log("PROBLEM: Could not find a scene item for source '" .. source_name .. "' in the current scene.")
+        log("         Make sure the source is actually placed in the currently active scene (or one of")
+        log("         its nested groups/scenes), and that the name matches exactly.")
+        log("================================================================================")
+        return
+    end
+
+    local info = obs.obs_transform_info()
+    get_transform(sceneitem, info)
+
+    log("Zoom Source: '" .. source_name .. "'")
+    log("Scene item position: " .. string.format("%.1f", info.pos.x) .. ", " .. string.format("%.1f", info.pos.y))
+    log("Scene item scale: " .. string.format("%.3f", info.scale.x) .. ", " .. string.format("%.3f", info.scale.y))
+
+    local bt_name = "NONE (plain position/scale, no bounding box)"
+    if info.bounds_type == obs.OBS_BOUNDS_SCALE_INNER then
+        bt_name = "SCALE_INNER ('contain' - can letterbox with black bars if aspect ratio mismatches!)"
+    elseif info.bounds_type == obs.OBS_BOUNDS_SCALE_OUTER then
+        bt_name = "SCALE_OUTER ('cover' - recommended for full-canvas zoom sources)"
+    elseif info.bounds_type == obs.OBS_BOUNDS_STRETCH then
+        bt_name = "STRETCH (ignores aspect ratio, always fills exactly)"
+    elseif info.bounds_type == obs.OBS_BOUNDS_SCALE_TO_WIDTH then
+        bt_name = "SCALE_TO_WIDTH"
+    elseif info.bounds_type == obs.OBS_BOUNDS_SCALE_TO_HEIGHT then
+        bt_name = "SCALE_TO_HEIGHT"
+    elseif info.bounds_type == obs.OBS_BOUNDS_MAX_ONLY then
+        bt_name = "MAX_ONLY"
+    end
+    log("Bounds type: " .. bt_name)
+    log("Bounds size: " .. string.format("%.1f", info.bounds.x) .. " x " .. string.format("%.1f", info.bounds.y))
+
+    local ovi = obs.obs_video_info()
+    obs.obs_get_video_info(ovi)
+    log("Canvas (base) resolution: " .. ovi.base_width .. "x" .. ovi.base_height)
+
+    if info.bounds_type == obs.OBS_BOUNDS_SCALE_INNER then
+        log("WARNING: 'Scale to Inner Bounds' can letterbox the source with black bars if its aspect")
+        log("         ratio doesn't match the canvas. 'Scale to Outer Bounds' is usually what you want.")
+    end
+
+    if use_monitor_override then
+        log("NOTE: 'Set manual source position' is ENABLED - automatic canvas-fit checks are skipped,")
+        log("      since you're managing position/size manually.")
+    end
+
+    log("Zoom rescale filter present: " .. tostring(scale_filter ~= nil) ..
+        " (this keeps the source's reported size constant while zooming - should always be true while zoomed)")
+
+    local scenes = obs.obs_frontend_get_scenes()
+    if scenes ~= nil then
+        local other_scene_count = 0
+        for _, scene_source in ipairs(scenes) do
+            local scene_name = obs.obs_source_get_name(scene_source)
+            local sc = obs.obs_scene_from_source(scene_source)
+            if sc ~= nil then
+                local found = obs.obs_scene_find_source(sc, source_name)
+                if found ~= nil then
+                    other_scene_count = other_scene_count + 1
+                    log("Source also present in scene: '" .. scene_name .. "'")
+                end
+            end
+        end
+        obs.source_list_release(scenes)
+
+        if other_scene_count > 1 and not fix_all_scenes then
+            log("NOTE: The source appears in " .. other_scene_count .. " scenes. Only the currently active")
+            log("      scene's transform is auto-fixed by default. Enable 'Fix All Scenes' if you want")
+            log("      every scene containing this source to be forced to fill the canvas.")
+        end
+    end
+
+    log("==================== End of diagnostics - review WARNING/PROBLEM lines above ====================")
 end
 
 ---
@@ -856,54 +1244,16 @@ function get_target_position(zoom)
     return { crop = crop, raw_center = mouse, clamped_center = { x = math.floor(crop.x + crop.w * 0.5), y = math.floor(crop.y + crop.h * 0.5) } }
 end
 
-function on_toggle_follow(pressed)
-    if pressed then
-        is_following_mouse = not is_following_mouse
-        log("Tracking mouse is " .. (is_following_mouse and "on" or "off"))
-
-        if is_following_mouse and zoom_state == ZoomState.ZoomedIn then
-            if is_timer_running == false then
-                is_timer_running = true
-                local timer_interval = math.floor(obs.obs_get_frame_interval_ns() / 1000000)
-                obs.timer_add(on_timer, timer_interval)
-            end
-        end
-    end
-end
-
 function on_toggle_zoom(pressed)
     if pressed then
-        -- Erzwingt bei JEDEM Tastendruck (nicht nur bei seltenen Lade-Events), dass die Quelle
-        -- exakt die Canvas-Groesse ausfuellt. Das ist der zuverlaessigste Zeitpunkt, da hier
-        -- garantiert ist, dass 'sceneitem' bereits gueltig aufgeloest wurde.
-        force_canvas_fit()
-
         if zoom_state == ZoomState.ZoomedIn or zoom_state == ZoomState.None then
-            if zoom_state == ZoomState.ZoomedIn then
-                log("Zooming out")
-                zoom_state = ZoomState.ZoomingOut
-                zoom_time = 0
-                locked_center = nil
-                locked_last_pos = nil
-                zoom_target = { crop = crop_filter_info_orig, c = sceneitem_crop_orig }
-                if is_following_mouse then
-                    is_following_mouse = false
-                    log("Tracking mouse is off (due to zoom out)")
-                end
-            else
-                log("Zooming in")
-                zoom_state = ZoomState.ZoomingIn
-                zoom_info.zoom_to = zoom_value
-                zoom_time = 0
-                locked_center = nil
-                locked_last_pos = nil
-                zoom_target = get_target_position(zoom_info)
-            end
+            cycle_step = 0
+            direct_zoom_active_level = nil
 
-            if is_timer_running == false then
-                is_timer_running = true
-                local timer_interval = math.floor(obs.obs_get_frame_interval_ns() / 1000000)
-                obs.timer_add(on_timer, timer_interval)
+            if zoom_state == ZoomState.ZoomedIn then
+                start_zoom_out()
+            else
+                start_zoom_in_at_level(zoom_value)
             end
         end
     end
@@ -925,7 +1275,7 @@ function on_timer()
                 set_crop_settings(crop_filter_info)
             end
         else
-            if is_following_mouse then
+            if is_following_mouse and not is_manually_frozen then
                 zoom_target = get_target_position(zoom_info)
 
                 local skip_frame = false
@@ -1102,14 +1452,22 @@ end
 function on_frontend_event(event)
     if event == obs.OBS_FRONTEND_EVENT_SCENE_CHANGED then
         log("OBS Scene changed")
+        handle_scene_changed_for_zoom_memory()
         if is_obs_loaded then
             refresh_sceneitem(true)
+            if fix_all_scenes then
+                force_canvas_fit_all_scenes()
+            end
         end
     elseif event == obs.OBS_FRONTEND_EVENT_FINISHED_LOADING then
         log("OBS Loaded")
         is_obs_loaded = true
         monitor_info = get_monitor_info(source)
+        current_scene_name = get_current_scene_name()
         refresh_sceneitem(true)
+        if fix_all_scenes then
+            force_canvas_fit_all_scenes()
+        end
     elseif event == obs.OBS_FRONTEND_EVENT_SCRIPTING_SHUTDOWN then
         log("OBS Shutting down")
         if is_script_loaded then
@@ -1127,6 +1485,7 @@ function on_update_transform()
 end
 
 function on_settings_modified(props, prop, settings)
+    current_settings = settings
     local name = obs.obs_property_name(prop)
 
     if name == "use_monitor_override" then
@@ -1160,16 +1519,209 @@ function on_settings_modified(props, prop, settings)
     return false
 end
 
+---
+-- Bundles the current "feel" settings (zoom levels, speed, follow behavior) into a
+-- fresh obs_data_t, suitable for saving as a named preset. Deliberately excludes source
+-- selection / monitor overrides / socket settings, since presets are about zoom behavior,
+-- not which source you're zooming.
+---@return userdata obs_data_t
+function build_preset_data()
+    local d = obs.obs_data_create()
+    obs.obs_data_set_double(d, "zoom_value", zoom_value)
+    obs.obs_data_set_double(d, "zoom_speed", zoom_speed)
+    obs.obs_data_set_double(d, "zoom_level_1", zoom_level_1)
+    obs.obs_data_set_double(d, "zoom_level_2", zoom_level_2)
+    obs.obs_data_set_double(d, "zoom_level_3", zoom_level_3)
+    obs.obs_data_set_bool(d, "follow", use_auto_follow_mouse)
+    obs.obs_data_set_bool(d, "follow_outside_bounds", use_follow_outside_bounds)
+    obs.obs_data_set_double(d, "follow_speed", follow_speed)
+    obs.obs_data_set_int(d, "follow_border", follow_border)
+    obs.obs_data_set_int(d, "follow_safezone_sensitivity", follow_safezone_sensitivity)
+    obs.obs_data_set_bool(d, "follow_auto_lock", use_follow_auto_lock)
+    obs.obs_data_set_bool(d, "per_scene_zoom_memory", use_per_scene_zoom_memory)
+    obs.obs_data_set_bool(d, "fix_all_scenes", fix_all_scenes)
+    return d
+end
+
+---
+-- Applies a preset's obs_data_t (as produced by build_preset_data) to the live script state
+-- and writes it back into the script's own settings object so the UI reflects the change.
+---@param d userdata obs_data_t
+function apply_preset_data(d)
+    zoom_value = obs.obs_data_get_double(d, "zoom_value")
+    zoom_speed = obs.obs_data_get_double(d, "zoom_speed")
+    zoom_level_1 = obs.obs_data_get_double(d, "zoom_level_1")
+    zoom_level_2 = obs.obs_data_get_double(d, "zoom_level_2")
+    zoom_level_3 = obs.obs_data_get_double(d, "zoom_level_3")
+    cycle_step = 0
+    direct_zoom_active_level = nil
+    use_auto_follow_mouse = obs.obs_data_get_bool(d, "follow")
+    use_follow_outside_bounds = obs.obs_data_get_bool(d, "follow_outside_bounds")
+    follow_speed = obs.obs_data_get_double(d, "follow_speed")
+    follow_border = obs.obs_data_get_int(d, "follow_border")
+    follow_safezone_sensitivity = obs.obs_data_get_int(d, "follow_safezone_sensitivity")
+    use_follow_auto_lock = obs.obs_data_get_bool(d, "follow_auto_lock")
+    use_per_scene_zoom_memory = obs.obs_data_get_bool(d, "per_scene_zoom_memory")
+    fix_all_scenes = obs.obs_data_get_bool(d, "fix_all_scenes")
+
+    if current_settings ~= nil then
+        obs.obs_data_set_double(current_settings, "zoom_value", zoom_value)
+        obs.obs_data_set_double(current_settings, "zoom_speed", zoom_speed)
+        obs.obs_data_set_double(current_settings, "zoom_level_1", zoom_level_1)
+        obs.obs_data_set_double(current_settings, "zoom_level_2", zoom_level_2)
+        obs.obs_data_set_double(current_settings, "zoom_level_3", zoom_level_3)
+        obs.obs_data_set_bool(current_settings, "follow", use_auto_follow_mouse)
+        obs.obs_data_set_bool(current_settings, "follow_outside_bounds", use_follow_outside_bounds)
+        obs.obs_data_set_double(current_settings, "follow_speed", follow_speed)
+        obs.obs_data_set_int(current_settings, "follow_border", follow_border)
+        obs.obs_data_set_int(current_settings, "follow_safezone_sensitivity", follow_safezone_sensitivity)
+        obs.obs_data_set_bool(current_settings, "follow_auto_lock", use_follow_auto_lock)
+        obs.obs_data_set_bool(current_settings, "per_scene_zoom_memory", use_per_scene_zoom_memory)
+        obs.obs_data_set_bool(current_settings, "fix_all_scenes", fix_all_scenes)
+    end
+end
+
+---
+-- Returns the list of saved preset names (stored as a delimited string in script settings)
+---@return table
+function get_preset_names()
+    local names = {}
+    if current_settings ~= nil then
+        local str = obs.obs_data_get_string(current_settings, "preset_names")
+        for token in string.gmatch(str, "[^\30]+") do
+            table.insert(names, token)
+        end
+    end
+    return names
+end
+
+---@param names table
+function set_preset_names(names)
+    if current_settings ~= nil then
+        obs.obs_data_set_string(current_settings, "preset_names", table.concat(names, "\30"))
+    end
+end
+
+---@param list userdata obs_property_t (a list property)
+function populate_preset_list(list)
+    obs.obs_property_list_clear(list)
+    obs.obs_property_list_add_string(list, "<Select a preset>", "")
+    for _, preset_name in ipairs(get_preset_names()) do
+        obs.obs_property_list_add_string(list, preset_name, preset_name)
+    end
+end
+
+function on_save_preset_clicked(props, property)
+    if current_settings == nil then
+        return true
+    end
+
+    local name = obs.obs_data_get_string(current_settings, "preset_name_input")
+    name = name:match("^%s*(.-)%s*$")
+    if name == nil or name == "" then
+        log("WARNING: Enter a preset name before saving.")
+        return true
+    end
+
+    local d = build_preset_data()
+    local json = obs.obs_data_get_json(d)
+    obs.obs_data_release(d)
+    obs.obs_data_set_string(current_settings, "preset:" .. name, json)
+
+    local names = get_preset_names()
+    local exists = false
+    for _, n in ipairs(names) do
+        if n == name then
+            exists = true
+        end
+    end
+    if not exists then
+        table.insert(names, name)
+        set_preset_names(names)
+    end
+
+    log("Saved preset '" .. name .. "'.")
+
+    local preset_list = obs.obs_properties_get(props, "preset_select")
+    if preset_list ~= nil then
+        populate_preset_list(preset_list)
+    end
+
+    return true
+end
+
+function on_load_preset_clicked(props, property)
+    if current_settings == nil then
+        return true
+    end
+
+    local name = obs.obs_data_get_string(current_settings, "preset_select")
+    if name == nil or name == "" then
+        log("WARNING: Select a preset to load first.")
+        return true
+    end
+
+    local json = obs.obs_data_get_string(current_settings, "preset:" .. name)
+    if json == nil or json == "" then
+        log("WARNING: Preset '" .. name .. "' not found.")
+        return true
+    end
+
+    local d = obs.obs_data_create_from_json(json)
+    if d ~= nil then
+        apply_preset_data(d)
+        obs.obs_data_release(d)
+        log("Loaded preset '" .. name .. "'.")
+    end
+
+    return true
+end
+
+function on_delete_preset_clicked(props, property)
+    if current_settings == nil then
+        return true
+    end
+
+    local name = obs.obs_data_get_string(current_settings, "preset_select")
+    if name == nil or name == "" then
+        log("WARNING: Select a preset to delete first.")
+        return true
+    end
+
+    local names = get_preset_names()
+    local new_names = {}
+    for _, n in ipairs(names) do
+        if n ~= name then
+            table.insert(new_names, n)
+        end
+    end
+    set_preset_names(new_names)
+
+    log("Deleted preset '" .. name .. "' (settings entry cleared on next save).")
+
+    local preset_list = obs.obs_properties_get(props, "preset_select")
+    if preset_list ~= nil then
+        populate_preset_list(preset_list)
+    end
+
+    return true
+end
+
 function log_current_settings()
     local settings = {
         zoom_value = zoom_value,
         zoom_speed = zoom_speed,
+        zoom_level_1 = zoom_level_1,
+        zoom_level_2 = zoom_level_2,
+        zoom_level_3 = zoom_level_3,
         use_auto_follow_mouse = use_auto_follow_mouse,
         use_follow_outside_bounds = use_follow_outside_bounds,
         follow_speed = follow_speed,
         follow_border = follow_border,
         follow_safezone_sensitivity = follow_safezone_sensitivity,
         use_follow_auto_lock = use_follow_auto_lock,
+        use_per_scene_zoom_memory = use_per_scene_zoom_memory,
+        fix_all_scenes = fix_all_scenes,
         use_monitor_override = use_monitor_override,
         monitor_override_x = monitor_override_x,
         monitor_override_y = monitor_override_y,
@@ -1194,45 +1746,94 @@ end
 
 function on_print_help()
     local help = "\n----------------------------------------------------\n" ..
-        "Help Information for OBS-Zoom-To-Mouse v" .. VERSION .. "\n" ..
-        "https://github.com/BlankSourceCode/obs-zoom-to-mouse\n" ..
+        "Help Information for Zoom to Mouse Pro v" .. VERSION .. "\n" ..
         "----------------------------------------------------\n" ..
-        "This script will zoom the selected display-capture source to focus on the mouse\n\n"
+        "This script smoothly zooms the selected display-capture source to focus on the mouse.\n\n"
 
     obs.script_log(obs.OBS_LOG_INFO, help)
 end
 
 function script_description()
-    return "Zoom the selected display-capture source to focus on the mouse (Ported to new OBS by Timexo)"
+    return "<h2 style='margin-bottom:0px;'>Zoom to Mouse Pro</h2>" ..
+        "<div style='color:gray;font-size:11px;margin-top:0px;margin-bottom:8px;'>v" .. VERSION .. "</div>" ..
+        "Smoothly zooms a display-capture source to follow your mouse. " ..
+        "Includes dedicated zoom-level hotkeys, a stepped cycle hotkey, per-scene zoom memory, " ..
+        "a freeze hotkey, presets, and a setup diagnostics check."
+end
+
+---
+-- Opens a URL in the user's default browser (best effort - falls back to just logging the
+-- link if the platform command isn't available, so the user can still copy/paste it manually)
+---@param url string
+function open_url(url)
+    local ok = false
+    if ffi.os == "Windows" then
+        ok = pcall(function() os.execute('start "" "' .. url .. '"') end)
+    elseif ffi.os == "OSX" then
+        ok = pcall(function() os.execute('open "' .. url .. '"') end)
+    else
+        ok = pcall(function() os.execute('xdg-open "' .. url .. '"') end)
+    end
+
+    if not ok then
+        log("Could not open the browser automatically - here's the link: " .. url)
+    end
 end
 
 function script_properties()
     local props = obs.obs_properties_create()
 
+    -- --- Source ---
     local sources_list = obs.obs_properties_add_list(props, "source", "Zoom Source", obs.OBS_COMBO_TYPE_LIST,
         obs.OBS_COMBO_FORMAT_STRING)
-
     populate_zoom_sources(sources_list)
 
-    local refresh_sources = obs.obs_properties_add_button(props, "refresh", "Refresh zoom sources",
+    obs.obs_properties_add_button(props, "refresh", "Refresh zoom sources",
         function()
             populate_zoom_sources(sources_list)
             monitor_info = get_monitor_info(source)
             return true
         end)
 
-    local zoom = obs.obs_properties_add_float(props, "zoom_value", "Zoom Factor", 1, 5, 0.5)
-    local zoom_speed = obs.obs_properties_add_float_slider(props, "zoom_speed", "Zoom Speed", 0.01, 1, 0.01)
-    local follow = obs.obs_properties_add_bool(props, "follow", "Auto follow mouse ")
-    local follow_outside_bounds = obs.obs_properties_add_bool(props, "follow_outside_bounds", "Follow outside bounds ")
-    local follow_speed = obs.obs_properties_add_float_slider(props, "follow_speed", "Follow Speed", 0.01, 1, 0.01)
-    local follow_border = obs.obs_properties_add_int_slider(props, "follow_border", "Follow Border", 0, 50, 1)
-    local safezone_sense = obs.obs_properties_add_int_slider(props,
-        "follow_safezone_sensitivity", "Lock Sensitivity", 1, 20, 1)
-    local follow_auto_lock = obs.obs_properties_add_bool(props, "follow_auto_lock", "Auto Lock on reverse direction ")
-
     local allow_all = obs.obs_properties_add_bool(props, "allow_all_sources", "Allow any zoom source ")
 
+    -- --- Zoom Levels & hotkeys ---
+    local zoom_group_props = obs.obs_properties_create()
+    obs.obs_properties_add_float(zoom_group_props, "zoom_value", "Zoom Factor (main Toggle Zoom hotkey)", 1, 5, 0.5)
+    obs.obs_properties_add_float(zoom_group_props, "zoom_level_1", "Zoom Level 1 (dedicated hotkey)", 1, 10, 0.1)
+    obs.obs_properties_add_float(zoom_group_props, "zoom_level_2", "Zoom Level 2 (dedicated hotkey)", 1, 10, 0.1)
+    obs.obs_properties_add_float(zoom_group_props, "zoom_level_3", "Zoom Level 3 (dedicated hotkey)", 1, 10, 0.1)
+    local levels_info = obs.obs_properties_add_text(zoom_group_props, "zoom_levels_info",
+        "", obs.OBS_TEXT_INFO)
+    obs.obs_property_set_long_description(levels_info,
+        "Assign hotkeys under Settings > Hotkeys:\n" ..
+        "- 'Zoom to Level 1/2/3': jump straight to that level (press again to zoom back out)\n" ..
+        "- 'Cycle zoom level': steps Level 1 -> Level 2 -> Level 3 -> zoomed out, one press at a time\n" ..
+        "- 'Toggle zoom to mouse': simple in/out toggle using 'Zoom Factor' above\n" ..
+        "- 'Freeze/unfreeze zoom view': pause mouse tracking without zooming out")
+    obs.obs_properties_add_float_slider(zoom_group_props, "zoom_speed", "Zoom Speed", 0.01, 1, 0.01)
+    obs.obs_properties_add_group(props, "zoom_levels_group", "Zoom Levels", obs.OBS_GROUP_NORMAL, zoom_group_props)
+
+    -- --- Mouse follow behavior ---
+    local follow_group_props = obs.obs_properties_create()
+    obs.obs_properties_add_bool(follow_group_props, "follow", "Auto follow mouse ")
+    obs.obs_properties_add_bool(follow_group_props, "follow_outside_bounds", "Follow outside bounds ")
+    obs.obs_properties_add_float_slider(follow_group_props, "follow_speed", "Follow Speed", 0.01, 1, 0.01)
+    obs.obs_properties_add_int_slider(follow_group_props, "follow_border", "Follow Border", 0, 50, 1)
+    obs.obs_properties_add_int_slider(follow_group_props,
+        "follow_safezone_sensitivity", "Lock Sensitivity", 1, 20, 1)
+    obs.obs_properties_add_bool(follow_group_props, "follow_auto_lock", "Auto Lock on reverse direction ")
+    obs.obs_properties_add_group(props, "follow_group", "Mouse Follow Behavior", obs.OBS_GROUP_NORMAL,
+        follow_group_props)
+
+    -- --- Scene behavior ---
+    local scene_group_props = obs.obs_properties_create()
+    obs.obs_properties_add_bool(scene_group_props, "per_scene_zoom_memory", "Remember zoom level per scene ")
+    obs.obs_properties_add_bool(scene_group_props, "fix_all_scenes",
+        "Fix canvas-fit in ALL scenes containing this source (not just the active one) ")
+    obs.obs_properties_add_group(props, "scene_group", "Scene Behavior", obs.OBS_GROUP_NORMAL, scene_group_props)
+
+    -- --- Advanced: manual position override ---
     local override_props = obs.obs_properties_create();
     local override_label = obs.obs_properties_add_text(override_props, "monitor_override_label", "", obs.OBS_TEXT_INFO)
     local override_x = obs.obs_properties_add_int(override_props, "monitor_override_x", "X", -10000, 10000, 1)
@@ -1259,8 +1860,44 @@ function script_properties()
         obs.obs_property_set_modified_callback(socket, on_settings_modified)
     end
 
-    local help = obs.obs_properties_add_button(props, "help_button", "More Info", on_print_help)
-    local debug = obs.obs_properties_add_bool(props, "debug_logs", "Enable debug logging ")
+    -- --- Presets ---
+    local preset_props = obs.obs_properties_create()
+    obs.obs_properties_add_text(preset_props, "preset_name_input", "New Preset Name", obs.OBS_TEXT_DEFAULT)
+    local preset_select = obs.obs_properties_add_list(preset_props, "preset_select", "Saved Presets",
+        obs.OBS_COMBO_TYPE_LIST, obs.OBS_COMBO_FORMAT_STRING)
+    populate_preset_list(preset_select)
+    obs.obs_properties_add_button(preset_props, "save_preset", "Save current settings as preset",
+        on_save_preset_clicked)
+    obs.obs_properties_add_button(preset_props, "load_preset", "Load selected preset", on_load_preset_clicked)
+    obs.obs_properties_add_button(preset_props, "delete_preset", "Delete selected preset", on_delete_preset_clicked)
+    obs.obs_properties_add_group(props, "presets_group", "Presets (Zoom Levels, Speed, Follow behavior) ",
+        obs.OBS_GROUP_NORMAL, preset_props)
+
+    -- --- Diagnostics & debug ---
+    local debug_group_props = obs.obs_properties_create()
+    obs.obs_properties_add_button(debug_group_props, "help_button", "More Info", on_print_help)
+    obs.obs_properties_add_button(debug_group_props, "run_diagnostics", "Run Setup Diagnostics (check Script Log)",
+        function(p, prop)
+            run_diagnostics()
+            return true
+        end)
+    local debug = obs.obs_properties_add_bool(debug_group_props, "debug_logs", "Enable debug logging ")
+    obs.obs_properties_add_group(props, "debug_group", "Diagnostics & Debug", obs.OBS_GROUP_NORMAL,
+        debug_group_props)
+
+    -- --- Support ---
+    local support_props = obs.obs_properties_create()
+    obs.obs_properties_add_button(support_props, "support_youtube", "YouTube: Timexo",
+        function(p, prop)
+            open_url("https://www.youtube.com/@timexo_official")
+            return false
+        end)
+    obs.obs_properties_add_button(support_props, "support_coffee", "Buy me a coffee",
+        function(p, prop)
+            open_url("https://timexo.gumroad.com/coffee")
+            return false
+        end)
+    obs.obs_properties_add_group(props, "support_group", "Support this Project", obs.OBS_GROUP_NORMAL, support_props)
 
     obs.obs_property_set_visible(override_label, not use_monitor_override)
     obs.obs_property_set_visible(override_x, use_monitor_override)
@@ -1281,6 +1918,7 @@ end
 
 function script_load(settings)
     sceneitem_info_orig = nil
+    current_settings = settings
 
     local current_scene = obs.obs_frontend_get_current_scene()
     is_obs_loaded = current_scene ~= nil 
@@ -1289,25 +1927,59 @@ function script_load(settings)
     hotkey_zoom_id = obs.obs_hotkey_register_frontend("toggle_zoom_hotkey", "Toggle zoom to mouse",
         on_toggle_zoom)
 
-    hotkey_follow_id = obs.obs_hotkey_register_frontend("toggle_follow_hotkey", "Toggle follow mouse during zoom",
-        on_toggle_follow)
+    hotkey_zoom_level_1_id = obs.obs_hotkey_register_frontend("zoom_level_1_hotkey", "Zoom to Level 1",
+        on_toggle_zoom_level_1)
+
+    hotkey_zoom_level_2_id = obs.obs_hotkey_register_frontend("zoom_level_2_hotkey", "Zoom to Level 2",
+        on_toggle_zoom_level_2)
+
+    hotkey_zoom_level_3_id = obs.obs_hotkey_register_frontend("zoom_level_3_hotkey", "Zoom to Level 3",
+        on_toggle_zoom_level_3)
+
+    hotkey_cycle_zoom_id = obs.obs_hotkey_register_frontend("cycle_zoom_level_hotkey", "Cycle zoom level (1 -> 2 -> 3 -> off)",
+        on_cycle_zoom_level)
+
+    hotkey_freeze_id = obs.obs_hotkey_register_frontend("toggle_freeze_hotkey", "Freeze/unfreeze zoom view",
+        on_toggle_freeze)
 
     local hotkey_save_array = obs.obs_data_get_array(settings, "obs_zoom_to_mouse.hotkey.zoom")
     obs.obs_hotkey_load(hotkey_zoom_id, hotkey_save_array)
     obs.obs_data_array_release(hotkey_save_array)
 
-    hotkey_save_array = obs.obs_data_get_array(settings, "obs_zoom_to_mouse.hotkey.follow")
-    obs.obs_hotkey_load(hotkey_follow_id, hotkey_save_array)
+    hotkey_save_array = obs.obs_data_get_array(settings, "obs_zoom_to_mouse.hotkey.zoom_level_1")
+    obs.obs_hotkey_load(hotkey_zoom_level_1_id, hotkey_save_array)
+    obs.obs_data_array_release(hotkey_save_array)
+
+    hotkey_save_array = obs.obs_data_get_array(settings, "obs_zoom_to_mouse.hotkey.zoom_level_2")
+    obs.obs_hotkey_load(hotkey_zoom_level_2_id, hotkey_save_array)
+    obs.obs_data_array_release(hotkey_save_array)
+
+    hotkey_save_array = obs.obs_data_get_array(settings, "obs_zoom_to_mouse.hotkey.zoom_level_3")
+    obs.obs_hotkey_load(hotkey_zoom_level_3_id, hotkey_save_array)
+    obs.obs_data_array_release(hotkey_save_array)
+
+    hotkey_save_array = obs.obs_data_get_array(settings, "obs_zoom_to_mouse.hotkey.cycle_zoom")
+    obs.obs_hotkey_load(hotkey_cycle_zoom_id, hotkey_save_array)
+    obs.obs_data_array_release(hotkey_save_array)
+
+    hotkey_save_array = obs.obs_data_get_array(settings, "obs_zoom_to_mouse.hotkey.freeze")
+    obs.obs_hotkey_load(hotkey_freeze_id, hotkey_save_array)
     obs.obs_data_array_release(hotkey_save_array)
 
     zoom_value = obs.obs_data_get_double(settings, "zoom_value")
     zoom_speed = obs.obs_data_get_double(settings, "zoom_speed")
+    zoom_level_1 = obs.obs_data_get_double(settings, "zoom_level_1")
+    zoom_level_2 = obs.obs_data_get_double(settings, "zoom_level_2")
+    zoom_level_3 = obs.obs_data_get_double(settings, "zoom_level_3")
     use_auto_follow_mouse = obs.obs_data_get_bool(settings, "follow")
     use_follow_outside_bounds = obs.obs_data_get_bool(settings, "follow_outside_bounds")
     follow_speed = obs.obs_data_get_double(settings, "follow_speed")
     follow_border = obs.obs_data_get_int(settings, "follow_border")
     follow_safezone_sensitivity = obs.obs_data_get_int(settings, "follow_safezone_sensitivity")
     use_follow_auto_lock = obs.obs_data_get_bool(settings, "follow_auto_lock")
+    use_per_scene_zoom_memory = obs.obs_data_get_bool(settings, "per_scene_zoom_memory")
+    fix_all_scenes = obs.obs_data_get_bool(settings, "fix_all_scenes")
+    deserialize_scene_zoom_memory(obs.obs_data_get_string(settings, "scene_zoom_memory_data"))
     allow_all_sources = obs.obs_data_get_bool(settings, "allow_all_sources")
     use_monitor_override = obs.obs_data_get_bool(settings, "use_monitor_override")
     monitor_override_x = obs.obs_data_get_int(settings, "monitor_override_x")
@@ -1359,7 +2031,11 @@ function script_unload()
         end
 
         obs.obs_hotkey_unregister(on_toggle_zoom)
-        obs.obs_hotkey_unregister(on_toggle_follow)
+        obs.obs_hotkey_unregister(on_toggle_zoom_level_1)
+        obs.obs_hotkey_unregister(on_toggle_zoom_level_2)
+        obs.obs_hotkey_unregister(on_toggle_zoom_level_3)
+        obs.obs_hotkey_unregister(on_cycle_zoom_level)
+        obs.obs_hotkey_unregister(on_toggle_freeze)
         obs.obs_frontend_remove_event_callback(on_frontend_event)
         release_sceneitem()
     end
@@ -1378,12 +2054,17 @@ end
 function script_defaults(settings)
     obs.obs_data_set_default_double(settings, "zoom_value", 2)
     obs.obs_data_set_default_double(settings, "zoom_speed", 0.06)
+    obs.obs_data_set_default_double(settings, "zoom_level_1", 1.5)
+    obs.obs_data_set_default_double(settings, "zoom_level_2", 2)
+    obs.obs_data_set_default_double(settings, "zoom_level_3", 3)
     obs.obs_data_set_default_bool(settings, "follow", true)
     obs.obs_data_set_default_bool(settings, "follow_outside_bounds", false)
     obs.obs_data_set_default_double(settings, "follow_speed", 0.25)
     obs.obs_data_set_default_int(settings, "follow_border", 8)
     obs.obs_data_set_default_int(settings, "follow_safezone_sensitivity", 4)
     obs.obs_data_set_default_bool(settings, "follow_auto_lock", false)
+    obs.obs_data_set_default_bool(settings, "per_scene_zoom_memory", false)
+    obs.obs_data_set_default_bool(settings, "fix_all_scenes", false)
     obs.obs_data_set_default_bool(settings, "allow_all_sources", false)
     obs.obs_data_set_default_bool(settings, "use_monitor_override", false)
     obs.obs_data_set_default_int(settings, "monitor_override_x", 0)
@@ -1407,14 +2088,41 @@ function script_save(settings)
         obs.obs_data_array_release(hotkey_save_array)
     end
 
-    if hotkey_follow_id ~= nil then
-        local hotkey_save_array = obs.obs_hotkey_save(hotkey_follow_id)
-        obs.obs_data_set_array(settings, "obs_zoom_to_mouse.hotkey.follow", hotkey_save_array)
+    if hotkey_zoom_level_1_id ~= nil then
+        local hotkey_save_array = obs.obs_hotkey_save(hotkey_zoom_level_1_id)
+        obs.obs_data_set_array(settings, "obs_zoom_to_mouse.hotkey.zoom_level_1", hotkey_save_array)
         obs.obs_data_array_release(hotkey_save_array)
     end
+
+    if hotkey_zoom_level_2_id ~= nil then
+        local hotkey_save_array = obs.obs_hotkey_save(hotkey_zoom_level_2_id)
+        obs.obs_data_set_array(settings, "obs_zoom_to_mouse.hotkey.zoom_level_2", hotkey_save_array)
+        obs.obs_data_array_release(hotkey_save_array)
+    end
+
+    if hotkey_zoom_level_3_id ~= nil then
+        local hotkey_save_array = obs.obs_hotkey_save(hotkey_zoom_level_3_id)
+        obs.obs_data_set_array(settings, "obs_zoom_to_mouse.hotkey.zoom_level_3", hotkey_save_array)
+        obs.obs_data_array_release(hotkey_save_array)
+    end
+
+    if hotkey_cycle_zoom_id ~= nil then
+        local hotkey_save_array = obs.obs_hotkey_save(hotkey_cycle_zoom_id)
+        obs.obs_data_set_array(settings, "obs_zoom_to_mouse.hotkey.cycle_zoom", hotkey_save_array)
+        obs.obs_data_array_release(hotkey_save_array)
+    end
+
+    if hotkey_freeze_id ~= nil then
+        local hotkey_save_array = obs.obs_hotkey_save(hotkey_freeze_id)
+        obs.obs_data_set_array(settings, "obs_zoom_to_mouse.hotkey.freeze", hotkey_save_array)
+        obs.obs_data_array_release(hotkey_save_array)
+    end
+
+    obs.obs_data_set_string(settings, "scene_zoom_memory_data", serialize_scene_zoom_memory())
 end
 
 function script_update(settings)
+    current_settings = settings
     local old_source_name = source_name
     local old_override = use_monitor_override
     local old_x = monitor_override_x
@@ -1432,12 +2140,17 @@ function script_update(settings)
     source_name = obs.obs_data_get_string(settings, "source")
     zoom_value = obs.obs_data_get_double(settings, "zoom_value")
     zoom_speed = obs.obs_data_get_double(settings, "zoom_speed")
+    zoom_level_1 = obs.obs_data_get_double(settings, "zoom_level_1")
+    zoom_level_2 = obs.obs_data_get_double(settings, "zoom_level_2")
+    zoom_level_3 = obs.obs_data_get_double(settings, "zoom_level_3")
     use_auto_follow_mouse = obs.obs_data_get_bool(settings, "follow")
     use_follow_outside_bounds = obs.obs_data_get_bool(settings, "follow_outside_bounds")
     follow_speed = obs.obs_data_get_double(settings, "follow_speed")
     follow_border = obs.obs_data_get_int(settings, "follow_border")
     follow_safezone_sensitivity = obs.obs_data_get_int(settings, "follow_safezone_sensitivity")
     use_follow_auto_lock = obs.obs_data_get_bool(settings, "follow_auto_lock")
+    use_per_scene_zoom_memory = obs.obs_data_get_bool(settings, "per_scene_zoom_memory")
+    fix_all_scenes = obs.obs_data_get_bool(settings, "fix_all_scenes")
     allow_all_sources = obs.obs_data_get_bool(settings, "allow_all_sources")
     use_monitor_override = obs.obs_data_get_bool(settings, "use_monitor_override")
     monitor_override_x = obs.obs_data_get_int(settings, "monitor_override_x")
@@ -1452,6 +2165,10 @@ function script_update(settings)
     socket_port = obs.obs_data_get_int(settings, "socket_port")
     socket_poll = obs.obs_data_get_int(settings, "socket_poll")
     debug_logs = obs.obs_data_get_bool(settings, "debug_logs")
+
+    if fix_all_scenes and is_obs_loaded then
+        force_canvas_fit_all_scenes()
+    end
 
     if source_name ~= old_source_name and is_obs_loaded then
         refresh_sceneitem(true)
